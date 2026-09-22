@@ -7,16 +7,20 @@ import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 from app import config
 from app.search.normalizer import TextNormalizer
 from app.search.dictionary import DictionaryManager
 
 
-def get_db_connection(db_path: Optional[Path] = None) -> sqlite3.Connection:
+def get_db_connection(db_path: Optional[Union[Path, str]] = None) -> sqlite3.Connection:
     """Get an open SQLite database connection with row factory enabled."""
     target_path = db_path or config.DATABASE_PATH
-    target_path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(target_path, str):
+        if target_path != ":memory:":
+            Path(target_path).parent.mkdir(parents=True, exist_ok=True)
+    elif isinstance(target_path, Path):
+        target_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(target_path))
     conn.row_factory = sqlite3.Row
     return conn
@@ -120,6 +124,21 @@ def init_database(db_path: Optional[Path] = None, seed_data: bool = True) -> sql
         """
     )
 
+    # 6. Common Typos Table (Learned & Seeded)
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS common_typos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            wrong_word TEXT NOT NULL UNIQUE,
+            correct_word TEXT NOT NULL,
+            frequency INTEGER DEFAULT 1,
+            confidence REAL DEFAULT 95.0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
     # Indexes
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_books_norm_title ON books(normalized_title);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_books_norm_author ON books(normalized_author);")
@@ -128,8 +147,9 @@ def init_database(db_path: Optional[Path] = None, seed_data: bool = True) -> sql
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_logs_norm_query ON search_logs(normalized_query);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_search_dict_norm_word ON search_dictionary(normalized_word);")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_synonyms_word ON synonyms(word);")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_common_typos_wrong ON common_typos(wrong_word);")
 
-    # 6. SQLite FTS5 Full-Text Virtual Table
+    # 7. SQLite FTS5 Full-Text Virtual Table
     cursor.execute(
         """
         CREATE VIRTUAL TABLE IF NOT EXISTS books_fts USING fts5(
@@ -855,6 +875,36 @@ def seed_demo_books(conn: sqlite3.Connection) -> None:
     ]
     for w, syn in synonym_pairs:
         cursor.execute("INSERT INTO synonyms (word, synonym) VALUES (?, ?)", (w, syn))
+
+    # Insert initial common typos specified in Section 4, 13, 24, 26
+    initial_typos = [
+        ("habbits", "habits", 50, 96.5),
+        ("habit", "habits", 20, 92.0),
+        ("atomc", "atomic", 35, 95.0),
+        ("atomik", "atomic", 30, 95.0),
+        ("poter", "potter", 60, 96.0),
+        ("hary", "harry", 45, 95.0),
+        ("pooor", "poor", 40, 96.0),
+        ("mony", "money", 55, 95.5),
+        ("psychlogy", "psychology", 45, 96.0),
+        ("cleer", "clear", 40, 95.0),
+        ("alchmist", "alchemist", 45, 95.0),
+        ("alchm", "alchemist", 25, 92.0),
+        ("cohelo", "coelho", 35, 95.0),
+        ("housl", "housel", 30, 94.0),
+        ("morgn", "morgan", 25, 93.0),
+        ("thnk", "think", 25, 92.0),
+        ("effctive", "effective", 30, 94.0),
+        ("peopl", "people", 30, 94.0),
+    ]
+    for wrong, correct, freq, conf in initial_typos:
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO common_typos (wrong_word, correct_word, frequency, confidence)
+            VALUES (?, ?, ?, ?)
+            """,
+            (wrong, correct, freq, conf),
+        )
 
     # Commit transactions
     conn.commit()

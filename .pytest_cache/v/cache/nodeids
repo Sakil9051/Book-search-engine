@@ -1,4 +1,13 @@
 [
+  "tests/test_autocomplete_spelling.py::test_api_autocomplete_har",
+  "tests/test_autocomplete_spelling.py::test_api_search_with_did_you_mean",
+  "tests/test_autocomplete_spelling.py::test_autocomplete_fields_coverage",
+  "tests/test_autocomplete_spelling.py::test_autocomplete_max_10_suggestions",
+  "tests/test_autocomplete_spelling.py::test_autocomplete_min_chars",
+  "tests/test_autocomplete_spelling.py::test_autocomplete_typo_tolerance",
+  "tests/test_autocomplete_spelling.py::test_search_history_learning",
+  "tests/test_autocomplete_spelling.py::test_spelling_corrector_thresholds",
+  "tests/test_autocomplete_spelling.py::test_typo_dictionary_caching_and_persistence",
   "tests/test_fuzzy.py::test_damerau_transposition",
   "tests/test_fuzzy.py::test_jaro_winkler_similarity",
   "tests/test_fuzzy.py::test_levenshtein_distance",

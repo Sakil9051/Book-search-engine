@@ -20,12 +20,18 @@ from app.models.book import (
     SearchResponse,
     SearchResult,
 )
-from app.search.correction import SpellCorrector
+from app.search.autocomplete import AutocompleteEngine
 from app.search.dictionary import DictionaryManager
 from app.search.fuzzy import FuzzyMatcher
+from app.search.history import SearchHistoryManager
 from app.search.normalizer import TextNormalizer
 from app.search.ranking import RankingEngine
+from app.search.spelling import SpellingCorrector
 from app.search.tokenizer import Tokenizer
+from app.search.typo import TypoDictionary
+
+# Backward-compatible alias
+SpellCorrector = SpellingCorrector
 
 logger = logging.getLogger(__name__)
 
@@ -52,18 +58,18 @@ class SearchEngine:
             self.conn = get_db_connection(config.DATABASE_PATH)
             self._owns_conn = True
 
-        # In-memory dictionary and spell corrector
+        # In-memory dictionary, typo dict, and spelling corrector
         self.dict_manager = DictionaryManager(self.conn)
         self.dict_manager.ensure_loaded(self.conn)
-        self.corrector = SpellCorrector(self.dict_manager, self.conn)
+        self.typo_dict = TypoDictionary(self.conn)
+        self.typo_dict.ensure_loaded(self.conn)
+        self.corrector = SpellingCorrector(self.dict_manager, self.conn, self.typo_dict)
+        self.autocomplete_engine = AutocompleteEngine(self.conn, self.corrector)
+        self.history_manager = SearchHistoryManager(self.conn, self.typo_dict)
 
         # In-memory LRU query cache: normalized_query -> SearchResponse
         self._lru_cache: collections.OrderedDict = collections.OrderedDict()
         self._cache_size = config.SEARCH_CACHE_SIZE
-
-        # In-memory LRU autocomplete cache: cache_key -> AutocompleteResponse
-        self._autocomplete_cache: collections.OrderedDict = collections.OrderedDict()
-        self._autocomplete_cache_size = config.AUTOCOMPLETE_CACHE_SIZE
 
     def _get_connection(self) -> sqlite3.Connection:
         """Ensure connection is healthy."""
@@ -310,30 +316,31 @@ class SearchEngine:
             if level == "MEDIUM" or (norm_query != TextNormalizer.normalize(results[0].title)):
                 dym_text = results[0].title
 
+        correction_applied = (level == "HIGH" and effective_query != norm_query)
+
         response = SearchResponse(
+            original_query=clean_query,
             query=clean_query,
             corrected_query=effective_query,
+            correction_applied=correction_applied,
             correction_confidence=confidence,
+            confidence=confidence,
             correction_level=level,
             did_you_mean=dym_text,
+            suggestion=dym_text,
             total_results=len(results),
             execution_time_ms=elapsed_ms,
             results=results,
         )
 
-        # Step 6: Log Search Telemetry (Async or directly in SQLite)
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO search_logs (query, normalized_query, corrected_query, result_count)
-                VALUES (?, ?, ?, ?)
-                """,
-                (clean_query, norm_query, effective_query, len(results)),
-            )
-            self.conn.commit()
-        except Exception as log_err:
-            logger.warning("Could not log search telemetry: %s", log_err)
+        # Step 6: Log Search Telemetry via SearchHistoryManager
+        self.history_manager.log_search(
+            query=clean_query,
+            normalized_query=norm_query,
+            corrected_query=effective_query,
+            result_count=len(results),
+            conn=self.conn,
+        )
 
         # Store in LRU cache
         if len(self._lru_cache) >= self._cache_size:
@@ -347,266 +354,9 @@ class SearchEngine:
     ) -> AutocompleteResponse:
         """
         High-performance prefix & typo-tolerant autocomplete system.
-        Searches book titles, authors, and aliases using indexed prefix lookups,
-        SQLite FTS5, and fallback fuzzy matching for typographical errors.
-        Caches frequent queries in an in-memory LRU cache.
+        Searches book titles, authors, aliases, categories, and publishers.
         """
-        clean_prefix = prefix.strip()[:50]
-        # Start searching only after 2 characters
-        if len(clean_prefix) < 2:
-            return AutocompleteResponse(query=clean_prefix, suggestions=[], results=[])
-
-        norm_prefix = TextNormalizer.normalize(clean_prefix)
-        if len(norm_prefix) < 2:
-            return AutocompleteResponse(query=clean_prefix, suggestions=[], results=[])
-
-        # Enforce maximum of 10 suggestions
-        max_suggestions = min(max(1, limit), 10)
-        cache_key = f"{norm_prefix}:{max_suggestions}"
-
-        # 10. Check LRU Cache
-        if cache_key in self._autocomplete_cache:
-            cached_resp = self._autocomplete_cache[cache_key]
-            self._autocomplete_cache.move_to_end(cache_key)
-            return cached_resp
-
-        conn = self._get_connection()
-        cursor = conn.cursor()
-        seen_texts: Set[str] = set()
-        book_id_counts: Dict[int, int] = {}
-        suggestions: List[AutocompleteItem] = []
-
-        def can_add(item_type: str, book_id: int, text: str) -> bool:
-            norm_t = text.lower().strip()
-            if not norm_t or norm_t in seen_texts:
-                return False
-            # Allow at most 2 items per book id so suggestions stay diverse
-            if item_type == "book" and book_id_counts.get(book_id, 0) >= 2:
-                return False
-            return True
-
-        def add_item(
-            item_type: str,
-            book_id: int,
-            text: str,
-            author: Optional[str] = None,
-            isbn: Optional[str] = None,
-            category: Optional[str] = None,
-        ) -> bool:
-            if not can_add(item_type, book_id, text):
-                return False
-            seen_texts.add(text.lower().strip())
-            if item_type == "book":
-                book_id_counts[book_id] = book_id_counts.get(book_id, 0) + 1
-            suggestions.append(
-                AutocompleteItem(
-                    id=book_id,
-                    text=text,
-                    title=text,
-                    author=author,
-                    isbn=isbn,
-                    category=category,
-                    type=item_type,
-                )
-            )
-            return True
-
-        # Phase 1: High-Performance Indexed Prefix Matching
-        # 1. Matching Book Titles by Prefix (indexed idx_books_norm_title)
-        cursor.execute(
-            """
-            SELECT id, title, author, isbn, category, popularity_score
-            FROM books
-            WHERE normalized_title LIKE ?
-            ORDER BY popularity_score DESC LIMIT ?
-            """,
-            (f"{norm_prefix}%", max_suggestions),
-        )
-        for r in cursor.fetchall():
-            add_item("book", r["id"], r["title"], r["author"], r["isbn"], r["category"])
-
-        # 2. Matching Book Aliases by Prefix (indexed idx_aliases_norm_alias)
-        if len(suggestions) < max_suggestions:
-            cursor.execute(
-                """
-                SELECT b.id, b.title, b.author, b.isbn, b.category, a.alias, a.normalized_alias, a.confidence, b.popularity_score
-                FROM book_aliases a
-                JOIN books b ON b.id = a.book_id
-                WHERE a.normalized_alias LIKE ?
-                ORDER BY
-                  CASE WHEN a.normalized_alias = ? THEN 1 ELSE 2 END,
-                  a.confidence DESC, b.popularity_score DESC LIMIT ?
-                """,
-                (f"{norm_prefix}%", norm_prefix, max_suggestions),
-            )
-            for r in cursor.fetchall():
-                alias_clean = r["alias"].strip()
-                disp_text = alias_clean.title() if alias_clean.islower() else alias_clean
-                add_item("book", r["id"], disp_text, r["author"], r["isbn"], r["category"])
-                if len(suggestions) < max_suggestions:
-                    add_item("book", r["id"], r["title"], r["author"], r["isbn"], r["category"])
-
-        # 3. Matching Authors by Prefix (indexed idx_books_norm_author)
-        if len(suggestions) < max_suggestions:
-            cursor.execute(
-                """
-                SELECT id, title, author, isbn, category, popularity_score
-                FROM books
-                WHERE normalized_author LIKE ?
-                ORDER BY popularity_score DESC LIMIT ?
-                """,
-                (f"{norm_prefix}%", max_suggestions),
-            )
-            for r in cursor.fetchall():
-                add_item("author", r["id"], r["author"], r["author"], r["isbn"], r["category"])
-                if len(suggestions) < max_suggestions:
-                    add_item("book", r["id"], r["title"], r["author"], r["isbn"], r["category"])
-
-        # 4. SQLite FTS5 Prefix Matching (books_fts)
-        if len(suggestions) < max_suggestions:
-            tokens = [t for t in norm_prefix.split() if len(t) >= 2]
-            if tokens:
-                fts_query = " ".join([f'"{t}"*' for t in tokens])
-                try:
-                    cursor.execute(
-                        """
-                        SELECT rowid, title, author, category
-                        FROM books_fts
-                        WHERE books_fts MATCH ?
-                        LIMIT ?
-                        """,
-                        (fts_query, max_suggestions),
-                    )
-                    for r in cursor.fetchall():
-                        add_item("book", r[0], r[1], r[2], None, r[3])
-                except Exception as e:
-                    logger.debug("FTS5 autocomplete prefix search failed: %s", e)
-
-        # Phase 2: Typo-Tolerant & Fuzzy Matching
-        # Rule: Use fuzzy matching only when normal prefix matching doesn't produce enough results
-        if len(suggestions) < min(3, max_suggestions):
-            # A. Spell Correction on the Prefix
-            corrected_query, conf, level, _ = self.corrector.correct_query(clean_prefix, conn)
-            if corrected_query and corrected_query != norm_prefix and conf >= 60.0:
-                cursor.execute(
-                    """
-                    SELECT id, title, author, isbn, category
-                    FROM books
-                    WHERE normalized_title LIKE ?
-                    LIMIT ?
-                    """,
-                    (f"{corrected_query}%", max_suggestions),
-                )
-                for r in cursor.fetchall():
-                    add_item("book", r["id"], r["title"], r["author"], r["isbn"], r["category"])
-
-                cursor.execute(
-                    """
-                    SELECT b.id, b.title, b.author, b.isbn, b.category, a.alias
-                    FROM book_aliases a
-                    JOIN books b ON b.id = a.book_id
-                    WHERE a.normalized_alias LIKE ?
-                    LIMIT ?
-                    """,
-                    (f"{corrected_query}%", max_suggestions),
-                )
-                for r in cursor.fetchall():
-                    alias_clean = r["alias"].strip()
-                    disp_text = alias_clean.title() if alias_clean.islower() else alias_clean
-                    add_item("book", r["id"], disp_text, r["author"], r["isbn"], r["category"])
-                    add_item("book", r["id"], r["title"], r["author"], r["isbn"], r["category"])
-
-            # B. Candidate-level Fuzzy Prefix Matching across books and aliases
-            cursor.execute(
-                """
-                SELECT id, title, normalized_title, author, normalized_author, isbn, category, popularity_score
-                FROM books
-                """
-            )
-            all_books = cursor.fetchall()
-
-            cursor.execute(
-                """
-                SELECT b.id, b.title, b.author, b.isbn, b.category, a.alias, a.normalized_alias, b.popularity_score
-                FROM book_aliases a
-                JOIN books b ON b.id = a.book_id
-                """
-            )
-            all_aliases = cursor.fetchall()
-
-            fuzzy_candidates: List[dict] = []
-            for b in all_books:
-                t_slice = b["normalized_title"][:len(norm_prefix) + 4]
-                jw_t = FuzzyMatcher.jaro_winkler_similarity(norm_prefix, t_slice)
-
-                a_slice = (b["normalized_author"] or "")[:len(norm_prefix) + 4]
-                jw_a = FuzzyMatcher.jaro_winkler_similarity(norm_prefix, a_slice) if a_slice else 0.0
-
-                best_sim = max(jw_t, jw_a)
-                if best_sim >= 0.70:
-                    cand_type = "author" if jw_a > jw_t else "book"
-                    disp = b["author"] if cand_type == "author" else b["title"]
-                    fuzzy_candidates.append({
-                        "score": best_sim * 100.0 + (b["popularity_score"] * 0.1),
-                        "type": cand_type,
-                        "id": b["id"],
-                        "text": disp,
-                        "author": b["author"],
-                        "isbn": b["isbn"],
-                        "category": b["category"],
-                    })
-
-            for a in all_aliases:
-                al_slice = a["normalized_alias"][:len(norm_prefix) + 4]
-                jw_al = FuzzyMatcher.jaro_winkler_similarity(norm_prefix, al_slice)
-                if jw_al >= 0.75:
-                    alias_clean = a["alias"].strip()
-                    disp_text = alias_clean.title() if alias_clean.islower() else alias_clean
-                    fuzzy_candidates.append({
-                        "score": jw_al * 100.0 + (a["popularity_score"] * 0.1) + 5.0,
-                        "type": "book",
-                        "id": a["id"],
-                        "text": disp_text,
-                        "author": a["author"],
-                        "isbn": a["isbn"],
-                        "category": a["category"],
-                    })
-                    fuzzy_candidates.append({
-                        "score": jw_al * 100.0 + (a["popularity_score"] * 0.1) + 4.0,
-                        "type": "book",
-                        "id": a["id"],
-                        "text": a["title"],
-                        "author": a["author"],
-                        "isbn": a["isbn"],
-                        "category": a["category"],
-                    })
-
-            fuzzy_candidates.sort(key=lambda x: x["score"], reverse=True)
-            for fc in fuzzy_candidates:
-                if len(suggestions) >= max_suggestions:
-                    break
-                add_item(
-                    fc["type"],
-                    fc["id"],
-                    fc["text"],
-                    fc["author"],
-                    fc["isbn"],
-                    fc["category"],
-                )
-
-        final_items = suggestions[:max_suggestions]
-        response = AutocompleteResponse(
-            query=clean_prefix,
-            suggestions=final_items,
-            results=final_items,
-        )
-
-        # Store in LRU cache
-        if len(self._autocomplete_cache) >= self._autocomplete_cache_size:
-            self._autocomplete_cache.popitem(last=False)
-        self._autocomplete_cache[cache_key] = response
-
-        return response
+        return self.autocomplete_engine.autocomplete(prefix=prefix, limit=limit, conn=self.conn)
 
     def get_book(self, book_id: int) -> Optional[BookDetail]:
         """Fetch complete details for a single book by ID."""
@@ -643,66 +393,9 @@ class SearchEngine:
         """
         Record a user click on a search result.
         Enforces search history learning: if users frequently click a book for a query,
-        reinforces the association as a high-confidence alias.
+        reinforces the association as a high-confidence alias and learns typos.
         """
-        norm_query = TextNormalizer.normalize(query)
-        if not norm_query or book_id <= 0:
-            return False
-
-        conn = self._get_connection()
-        cursor = conn.cursor()
-
-        try:
-            # 1. Update search log
-            cursor.execute(
-                """
-                UPDATE search_logs
-                SET clicked_book_id = ?
-                WHERE id = (
-                    SELECT id FROM search_logs
-                    WHERE normalized_query = ?
-                    ORDER BY created_at DESC LIMIT 1
-                )
-                """,
-                (book_id, norm_query),
-            )
-
-            # If no recent log existed, insert a new entry
-            if cursor.rowcount == 0:
-                cursor.execute(
-                    """
-                    INSERT INTO search_logs (query, normalized_query, corrected_query, result_count, clicked_book_id)
-                    VALUES (?, ?, ?, 1, ?)
-                    """,
-                    (query, norm_query, norm_query, book_id),
-                )
-
-            # 2. History Learning: check how many times this query led to this book
-            cursor.execute(
-                """
-                SELECT COUNT(*) FROM search_logs
-                WHERE normalized_query = ? AND clicked_book_id = ?
-                """,
-                (norm_query, book_id),
-            )
-            count = cursor.fetchone()[0]
-
-            # If user clicked 2 or more times, ensure it's registered as an alias!
-            if count >= 2:
-                cursor.execute(
-                    """
-                    INSERT INTO book_aliases (book_id, alias, normalized_alias, source, confidence)
-                    VALUES (?, ?, ?, 'learned_history', ?)
-                    ON CONFLICT(id) DO NOTHING
-                    """,
-                    (book_id, query, norm_query, min(1.0, 0.70 + (count * 0.10))),
-                )
-
-            conn.commit()
-            return True
-        except Exception as e:
-            logger.error("Failed to register click log: %s", e)
-            return False
+        return self.history_manager.log_click(query=query, book_id=book_id, conn=self.conn)
 
     def close(self) -> None:
         """Close database connection if owned."""

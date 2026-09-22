@@ -40,26 +40,50 @@ class SearchResult(BaseModel):
 
 
 class SearchResponse(BaseModel):
-    """Unified search response matching Section 21 specification."""
-    query: str
+    """Unified search response matching Section 6 & 19 specification."""
+    original_query: str
+    query: Optional[str] = None
     corrected_query: str
-    correction_confidence: float
-    correction_level: str  # 'HIGH', 'MEDIUM', 'LOW'
+    correction_applied: bool = False
+    correction_confidence: float = 0.0
+    confidence: Optional[float] = None
+    correction_level: str = "LOW"  # 'HIGH', 'MEDIUM', 'LOW'
     did_you_mean: Optional[str] = None
+    suggestion: Optional[str] = None
     total_results: int = 0
     execution_time_ms: float = 0.0
     results: List[SearchResult] = Field(default_factory=list)
 
+    @model_validator(mode="before")
+    @classmethod
+    def sync_query_fields(cls, data: Any):
+        if isinstance(data, dict):
+            if "original_query" in data and "query" not in data:
+                data["query"] = data["original_query"]
+            elif "query" in data and "original_query" not in data:
+                data["original_query"] = data["query"]
+            if "correction_confidence" in data and "confidence" not in data:
+                data["confidence"] = data["correction_confidence"]
+            elif "confidence" in data and "correction_confidence" not in data:
+                data["correction_confidence"] = data["confidence"]
+            if "did_you_mean" in data and "suggestion" not in data:
+                data["suggestion"] = data["did_you_mean"]
+            elif "suggestion" in data and "did_you_mean" not in data:
+                data["did_you_mean"] = data["suggestion"]
+        return data
+
 
 class AutocompleteItem(BaseModel):
     """A suggestion item for prefix/autocomplete searches."""
-    type: str = "book"  # "book", "author", "alias"
-    id: int
-    text: str
+    type: str = "book"  # "book", "author", "alias", "category", "publisher"
+    id: Optional[int] = None
+    title: str
+    text: Optional[str] = None
     author: Optional[str] = None
-    title: Optional[str] = None
+    match: Optional[str] = None
     isbn: Optional[str] = None
     category: Optional[str] = None
+    publisher: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -73,8 +97,11 @@ class AutocompleteItem(BaseModel):
 
 
 class AutocompleteResponse(BaseModel):
-    """Response structure for /autocomplete endpoint."""
+    """Response structure for /autocomplete endpoint matching Section 18."""
     query: str
+    corrected_query: Optional[str] = None
+    correction_confidence: Optional[float] = None
+    did_you_mean: Optional[str] = None
     suggestions: List[AutocompleteItem] = Field(default_factory=list)
     results: List[AutocompleteItem] = Field(default_factory=list)
 
