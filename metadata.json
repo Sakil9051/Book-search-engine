@@ -1,0 +1,6 @@
+{
+  "name": "Book Search Engine",
+  "description": "A production-ready deterministic smart search engine for a book-selling website with fuzzy matching, spelling correction, phonetic search, ranking, and autocomplete.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

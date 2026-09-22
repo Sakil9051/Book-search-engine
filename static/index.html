@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Smart Book Search Engine | Deterministic & Typo-Tolerant</title>
+  <meta name="description" content="Production-ready deterministic book search engine with multi-algorithm fuzzy matching, phonetic similarity, and FTS5 candidate ranking." />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Playfair+Display:ital,wght@0,600;0,700;1,600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="app-layout">
+    <!-- Header -->
+    <header class="app-header">
+      <div class="header-inner">
+        <div class="brand">
+          <div class="brand-icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-0-5H20"/>
+            </svg>
+          </div>
+          <div>
+            <h1 class="brand-title">LibrisEngine</h1>
+            <span class="brand-subtitle">Deterministic Search Architecture</span>
+          </div>
+        </div>
+
+        <div class="header-actions">
+          <div class="engine-badge">
+            <span class="status-dot"></span>
+            <span>Zero AI / Pure Local Algorithms</span>
+          </div>
+          <button id="btn-stats" class="btn-secondary" title="View Search Telemetry & Vocabulary">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="18" y1="20" x2="18" y2="10"></line>
+              <line x1="12" y1="20" x2="12" y2="4"></line>
+              <line x1="6" y1="20" x2="6" y2="14"></line>
+            </svg>
+            <span>Telemetry</span>
+          </button>
+          <a href="/docs" target="_blank" class="btn-secondary" title="Interactive Swagger API Documentation">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+              <polyline points="14 2 14 8 20 8"></polyline>
+              <line x1="16" y1="13" x2="8" y2="13"></line>
+              <line x1="16" y1="17" x2="8" y2="17"></line>
+              <polyline points="10 9 9 9 8 9"></polyline>
+            </svg>
+            <span>API Docs</span>
+          </a>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Content Area -->
+    <main class="app-main">
+      <div class="search-hero">
+        <h2 class="hero-title">Smart Book Search Engine</h2>
+        <p class="hero-desc">
+          Tolerates misspelled titles, author names, missing words, transpositions, and phonetic mistakes using deterministic SQLite FTS5, Levenshtein, Jaro-Winkler, N-grams, and Soundex.
+        </p>
+
+        <!-- Search Form Container -->
+        <div class="search-box-wrapper">
+          <div class="search-input-group">
+            <div class="search-icon-box">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="11" cy="11" r="8"></circle>
+                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+              </svg>
+            </div>
+            <input
+              type="text"
+              id="search-input"
+              class="search-input"
+              placeholder="Search by title, author, typo, or ISBN (e.g. 'atomic habbits', 'harry poter', 'cleer')..."
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button id="btn-clear" class="btn-icon-clear hidden" title="Clear search">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <line x1="18" y1="6" x2="6" y2="18"></line>
+                <line x1="6" y1="6" x2="18" y2="18"></line>
+              </svg>
+            </button>
+            <div class="search-spinner hidden" id="search-spinner"></div>
+          </div>
+
+          <!-- Autocomplete Dropdown -->
+          <div id="autocomplete-list" class="autocomplete-dropdown hidden"></div>
+        </div>
+
+        <!-- Controls Toolbar (Debug toggle, limit) -->
+        <div class="search-toolbar">
+          <div class="toolbar-left">
+            <label class="toggle-control">
+              <input type="checkbox" id="debug-toggle" />
+              <span class="toggle-slider"></span>
+              <span class="toggle-label">Debug Mode (Show Scoring Formula)</span>
+            </label>
+          </div>
+          <div class="toolbar-right">
+            <span class="meta-note">Type 2+ letters for instant prefix suggestions</span>
+          </div>
+        </div>
+
+        <!-- Quick Benchmark Chips -->
+        <div class="benchmark-chips">
+          <span class="chips-label">Try Benchmark Tests:</span>
+          <div class="chips-list">
+            <button class="chip" data-query="atomic habbits">atomic habbits <em>(Typo)</em></button>
+            <button class="chip" data-query="harry poter">harry poter <em>(Phonetic)</em></button>
+            <button class="chip" data-query="psychology of mony">psychology of mony <em>(Typo)</em></button>
+            <button class="chip" data-query="alchmist">alchmist <em>(Missing letter)</em></button>
+            <button class="chip" data-query="james cleer">james cleer <em>(Author Soundex)</em></button>
+            <button class="chip" data-query="morgan housel">morgan housel <em>(Author)</em></button>
+            <button class="chip" data-query="rich dad pooor dad">rich dad pooor dad <em>(Extra letters)</em></button>
+            <button class="chip" data-query="think grow rich">think grow rich <em>(Missing word)</em></button>
+            <button class="chip" data-query="7 habits highly effective people">7 habits highly effective people <em>(Number alias)</em></button>
+            <button class="chip" data-query="9780735211292">9780735211292 <em>(Exact ISBN)</em></button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Results Container -->
+      <section class="results-section">
+        <!-- Correction Banner ("Did you mean...?") -->
+        <div id="correction-banner" class="correction-banner hidden">
+          <div class="correction-icon">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="12" y1="16" x2="12" y2="12"></line>
+              <line x1="12" y1="8" x2="12.01" y2="8"></line>
+            </svg>
+          </div>
+          <div class="correction-content">
+            <div id="correction-text" class="correction-text"></div>
+            <div id="correction-badge" class="confidence-pill"></div>
+          </div>
+        </div>
+
+        <!-- Search Status Bar -->
+        <div id="search-status-bar" class="search-status-bar hidden">
+          <div class="status-summary">
+            Showing <strong id="result-count">0</strong> results for "<span id="display-query"></span>"
+          </div>
+          <div class="status-meta">
+            <span id="execution-time" class="meta-tag">0.0 ms</span>
+            <span id="confidence-level-tag" class="meta-tag">HIGH</span>
+          </div>
+        </div>
+
+        <!-- Book Cards Grid / List -->
+        <div id="results-grid" class="results-grid">
+          <!-- Initial Welcome State -->
+          <div class="empty-state">
+            <div class="empty-icon">
+              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"></path>
+                <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"></path>
+              </svg>
+            </div>
+            <h3 class="empty-title">Deterministic Smart Search Ready</h3>
+            <p class="empty-text">Enter a title, author name, or deliberately misspell a query above to see the local correction and ranking pipeline in action.</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Book Detail Modal -->
+    <div id="book-modal" class="modal-overlay hidden">
+      <div class="modal-card">
+        <button id="modal-close" class="modal-close-btn" aria-label="Close modal">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+        <div class="modal-body" id="modal-body">
+          <!-- Populated by JavaScript -->
+        </div>
+      </div>
+    </div>
+
+    <!-- Telemetry Modal -->
+    <div id="stats-modal" class="modal-overlay hidden">
+      <div class="modal-card modal-card-wide">
+        <button id="stats-modal-close" class="modal-close-btn" aria-label="Close modal">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
+        </button>
+        <div class="modal-body">
+          <h3 class="modal-title">Engine Telemetry & Vocabulary Stats</h3>
+          <p class="modal-subtitle">Live system telemetry stored in SQLite tables.</p>
+
+          <div class="stats-grid" id="stats-grid">
+            <div class="stat-card">
+              <span class="stat-num" id="stat-books">-</span>
+              <span class="stat-lbl">Catalog Books</span>
+            </div>
+            <div class="stat-card">
+              <span class="stat-num" id="stat-vocab">-</span>
+              <span class="stat-lbl">Dictionary Words</span>
+            </div>
+            <div class="stat-card">
+              <span class="stat-num" id="stat-aliases">-</span>
+              <span class="stat-lbl">Registered Aliases</span>
+            </div>
+            <div class="stat-card">
+              <span class="stat-num" id="stat-queries">-</span>
+              <span class="stat-lbl">Queries Logged</span>
+            </div>
+          </div>
+
+          <div class="stats-section">
+            <h4 class="section-heading">Recent Search Queries (History Learning Log)</h4>
+            <div class="table-responsive">
+              <table class="data-table" id="recent-logs-table">
+                <thead>
+                  <tr>
+                    <th>Query</th>
+                    <th>Results</th>
+                    <th>Timestamp</th>
+                  </tr>
+                </thead>
+                <tbody id="recent-logs-body">
+                  <tr><td colspan="3">Loading telemetry...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
