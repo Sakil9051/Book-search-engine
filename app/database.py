@@ -274,6 +274,7 @@ def seed_demo_books(conn: sqlite3.Connection) -> None:
             "popularity_score": 99.0,
             "sales_count": 25000,
             "aliases": [
+                "harry potter",
                 "harry poter",
                 "harry potter 1",
                 "harry potter sorcerers stone",

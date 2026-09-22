@@ -277,12 +277,14 @@ body {
 
 .autocomplete-item {
   padding: 10px 16px;
+  min-height: 48px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   cursor: pointer;
   border-bottom: 1px solid #f8fafc;
   transition: background 0.15s ease;
+  -webkit-tap-highlight-color: transparent;
 }
 
 .autocomplete-item:last-child {
@@ -292,6 +294,14 @@ body {
 .autocomplete-item:hover,
 .autocomplete-item.active {
   background-color: var(--accent-light);
+}
+
+.ac-highlight {
+  background-color: #fef08a;
+  color: #1e293b;
+  font-weight: 700;
+  border-radius: 2px;
+  padding: 0 1px;
 }
 
 .ac-main {

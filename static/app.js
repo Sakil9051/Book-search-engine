@@ -31,6 +31,7 @@
   let debounceTimer = null;
   let currentActiveIndex = -1;
   let lastSearchQuery = "";
+  let autocompleteAbortController = null;
 
   // Initialize
   initEventListeners();
@@ -94,15 +95,26 @@
       clearBtn.classList.remove("hidden");
     } else {
       clearBtn.classList.add("hidden");
+      if (autocompleteAbortController) {
+        autocompleteAbortController.abort();
+      }
       hideAutocomplete();
       resetResults();
+      return;
+    }
+
+    if (query.length < 2) {
+      if (autocompleteAbortController) {
+        autocompleteAbortController.abort();
+      }
+      hideAutocomplete();
       return;
     }
 
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       fetchAutocomplete(query);
-    }, 180);
+    }, 200);
   }
 
   function handleKeyNavigation(e) {
@@ -145,6 +157,30 @@
     });
   }
 
+  // Highlight matching substring
+  function highlightMatch(text, query) {
+    if (!text) return "";
+    if (!query) return escapeHtml(text);
+    const tokens = query
+      .trim()
+      .split(/\s+/)
+      .filter((t) => t.length > 0);
+    if (!tokens.length) return escapeHtml(text);
+
+    const escapedTokens = tokens.map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    const regex = new RegExp(`(${escapedTokens.join("|")})`, "gi");
+
+    const parts = text.split(regex);
+    return parts
+      .map((part) => {
+        if (regex.test(part)) {
+          return `<mark class="ac-highlight">${escapeHtml(part)}</mark>`;
+        }
+        return escapeHtml(part);
+      })
+      .join("");
+  }
+
   // Autocomplete
   async function fetchAutocomplete(prefix) {
     if (prefix.length < 2) {
@@ -152,17 +188,48 @@
       return;
     }
 
+    // Cancel / abort previous pending request so older responses cannot overwrite newer results
+    if (autocompleteAbortController) {
+      autocompleteAbortController.abort();
+    }
+    autocompleteAbortController = new AbortController();
+
+    // Show loading spinner
+    spinner.classList.remove("hidden");
+
     try {
-      const resp = await fetch(`/autocomplete?q=${encodeURIComponent(prefix)}&limit=10`);
+      const resp = await fetch(`/autocomplete?q=${encodeURIComponent(prefix)}&limit=10`, {
+        signal: autocompleteAbortController.signal,
+      });
+
+      // Ignore if user has changed input while in-flight
+      if (searchInput.value.trim() !== prefix) {
+        return;
+      }
+
       if (!resp.ok) return;
       const data = await resp.json();
-      renderAutocomplete(data.results);
+
+      // Ensure fresh check
+      if (searchInput.value.trim() === prefix) {
+        const suggestions = data.suggestions || data.results || [];
+        renderAutocomplete(suggestions, prefix);
+      }
     } catch (err) {
+      if (err.name === "AbortError") {
+        // Stale request cancelled normally
+        return;
+      }
       console.error("Autocomplete error:", err);
+    } finally {
+      // Hide spinner if not running a full search
+      if (!searchInput.value.trim() || searchInput.value.trim() === prefix) {
+        spinner.classList.add("hidden");
+      }
     }
   }
 
-  function renderAutocomplete(items) {
+  function renderAutocomplete(items, query) {
     if (!items || items.length === 0) {
       hideAutocomplete();
       return;
@@ -171,22 +238,48 @@
     currentActiveIndex = -1;
     autocompleteList.innerHTML = "";
 
-    items.forEach((item) => {
+    // Maximum 10 suggestions
+    const topItems = items.slice(0, 10);
+
+    topItems.forEach((item) => {
       const div = document.createElement("div");
       div.className = "autocomplete-item";
+      div.setAttribute("role", "option");
+      div.setAttribute("tabindex", "-1");
+
+      const displayTitle = item.text || item.title || "";
+      const displayAuthor = item.author || item.category || "";
+      const itemType = item.type || "book";
+
+      const highlightedTitle = highlightMatch(displayTitle, query);
+      const highlightedAuthor = highlightMatch(displayAuthor, query);
+
       div.innerHTML = `
         <div class="ac-main">
-          <span class="ac-title">${escapeHtml(item.title)}</span>
-          <span class="ac-meta">${escapeHtml(item.author || item.category || "")}</span>
+          <span class="ac-title">${highlightedTitle}</span>
+          ${displayAuthor ? `<span class="ac-meta">${highlightedAuthor}</span>` : ""}
         </div>
-        <span class="ac-badge ${escapeHtml(item.type)}">${escapeHtml(item.type)}</span>
+        <span class="ac-badge ${escapeHtml(itemType)}">${escapeHtml(itemType)}</span>
       `;
 
-      div.addEventListener("click", () => {
-        searchInput.value = item.title;
+      // Touch / mouse interaction
+      // Use pointerdown with preventDefault to prevent input blur from closing before selection
+      const handleSelect = (e) => {
+        if (e) e.preventDefault();
+        searchInput.value = displayTitle;
         hideAutocomplete();
-        performSearch(item.title);
-      });
+
+        // Clicking a suggestion opens the book if it's a book
+        if (item.id && itemType !== "author") {
+          logClick(query, item.id);
+          openBookModal(item.id);
+        } else {
+          performSearch(displayTitle);
+        }
+      };
+
+      div.addEventListener("pointerdown", handleSelect);
+      div.addEventListener("click", handleSelect);
 
       autocompleteList.appendChild(div);
     });

@@ -113,9 +113,27 @@ def test_isbn_exact_search(engine):
 
 def test_autocomplete_prefix(engine):
     res = engine.autocomplete("har", limit=10)
-    assert len(res.results) > 0
-    titles = [item.title for item in res.results]
-    assert any("Harry Potter" in t for t in titles)
+    assert len(res.suggestions) > 0
+    assert len(res.suggestions) <= 10
+    texts = [item.text for item in res.suggestions]
+    assert any("Harry Potter" in t for t in texts)
+
+
+def test_autocomplete_typo_tolerance(engine):
+    res = engine.autocomplete("hary pot", limit=10)
+    assert len(res.suggestions) > 0
+    texts = [item.text for item in res.suggestions]
+    assert any("Harry Potter" in t or "Harry Poter" in t for t in texts)
+
+
+def test_autocomplete_min_chars(engine):
+    res = engine.autocomplete("h", limit=10)
+    assert len(res.suggestions) == 0
+
+
+def test_autocomplete_max_10(engine):
+    res = engine.autocomplete("a", limit=25)
+    assert len(res.suggestions) <= 10
 
 
 def test_history_learning_click_log(engine):
@@ -152,7 +170,26 @@ def test_api_autocomplete_endpoint(client):
     response = client.get("/autocomplete?q=har&limit=5")
     assert response.status_code == 200
     data = response.json()
+    assert data["query"] == "har"
+    assert "suggestions" in data
+    assert len(data["suggestions"]) > 0
+    assert len(data["suggestions"]) <= 5
+    first = data["suggestions"][0]
+    assert "type" in first
+    assert "id" in first
+    assert "text" in first
+    # Backward compatibility
+    assert "results" in data
     assert len(data["results"]) > 0
+
+
+def test_api_autocomplete_typo_query(client):
+    response = client.get("/autocomplete?q=hary%20pot")
+    assert response.status_code == 200
+    data = response.json()
+    assert len(data["suggestions"]) > 0
+    texts = [item["text"] for item in data["suggestions"]]
+    assert any("Harry Potter" in t or "Harry Poter" in t for t in texts)
 
 
 def test_api_book_detail_endpoint(client):

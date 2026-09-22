@@ -2,8 +2,8 @@
 Pydantic data models for search request/response serialization.
 """
 
-from typing import Dict, List, Optional
-from pydantic import BaseModel, Field
+from typing import Dict, List, Optional, Any
+from pydantic import BaseModel, Field, model_validator
 
 
 class ScoreBreakdown(BaseModel):
@@ -53,18 +53,40 @@ class SearchResponse(BaseModel):
 
 class AutocompleteItem(BaseModel):
     """A suggestion item for prefix/autocomplete searches."""
-    id: int
-    title: str
-    author: Optional[str] = None
     type: str = "book"  # "book", "author", "alias"
+    id: int
+    text: str
+    author: Optional[str] = None
+    title: Optional[str] = None
     isbn: Optional[str] = None
     category: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_text_and_title(cls, data: Any):
+        if isinstance(data, dict):
+            if "text" in data and "title" not in data:
+                data["title"] = data["text"]
+            elif "title" in data and "text" not in data:
+                data["text"] = data["title"]
+        return data
 
 
 class AutocompleteResponse(BaseModel):
     """Response structure for /autocomplete endpoint."""
     query: str
+    suggestions: List[AutocompleteItem] = Field(default_factory=list)
     results: List[AutocompleteItem] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def sync_suggestions_and_results(cls, data: Any):
+        if isinstance(data, dict):
+            if "suggestions" in data and "results" not in data:
+                data["results"] = data["suggestions"]
+            elif "results" in data and "suggestions" not in data:
+                data["suggestions"] = data["results"]
+        return data
 
 
 class BookDetail(BaseModel):

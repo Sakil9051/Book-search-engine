@@ -20,11 +20,12 @@ DEBUG_SEARCH = os.getenv("DEBUG_SEARCH", "false").lower() in ("true", "1", "yes"
 MAX_QUERY_LENGTH = int(os.getenv("MAX_QUERY_LENGTH", "150"))
 DEFAULT_SEARCH_LIMIT = int(os.getenv("DEFAULT_SEARCH_LIMIT", "20"))
 MAX_SEARCH_LIMIT = int(os.getenv("MAX_SEARCH_LIMIT", "50"))
-AUTOCOMPLETE_LIMIT = int(os.getenv("AUTOCOMPLETE_LIMIT", "15"))
+AUTOCOMPLETE_LIMIT = int(os.getenv("AUTOCOMPLETE_LIMIT", "10"))
 CANDIDATE_POOL_LIMIT = int(os.getenv("CANDIDATE_POOL_LIMIT", "80"))
 
-# In-memory LRU Cache size
+# In-memory LRU Cache sizes
 SEARCH_CACHE_SIZE = int(os.getenv("SEARCH_CACHE_SIZE", "500"))
+AUTOCOMPLETE_CACHE_SIZE = int(os.getenv("AUTOCOMPLETE_CACHE_SIZE", "500"))
 
 # Ranking weights (as requested in Section 19)
 EXACT_ISBN_WEIGHT = float(os.getenv("WEIGHT_EXACT_ISBN", "1000.0"))

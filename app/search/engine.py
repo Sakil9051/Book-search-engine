@@ -22,6 +22,7 @@ from app.models.book import (
 )
 from app.search.correction import SpellCorrector
 from app.search.dictionary import DictionaryManager
+from app.search.fuzzy import FuzzyMatcher
 from app.search.normalizer import TextNormalizer
 from app.search.ranking import RankingEngine
 from app.search.tokenizer import Tokenizer
@@ -59,6 +60,10 @@ class SearchEngine:
         # In-memory LRU query cache: normalized_query -> SearchResponse
         self._lru_cache: collections.OrderedDict = collections.OrderedDict()
         self._cache_size = config.SEARCH_CACHE_SIZE
+
+        # In-memory LRU autocomplete cache: cache_key -> AutocompleteResponse
+        self._autocomplete_cache: collections.OrderedDict = collections.OrderedDict()
+        self._autocomplete_cache_size = config.AUTOCOMPLETE_CACHE_SIZE
 
     def _get_connection(self) -> sqlite3.Connection:
         """Ensure connection is healthy."""
@@ -341,23 +346,73 @@ class SearchEngine:
         self, prefix: str, limit: int = config.AUTOCOMPLETE_LIMIT
     ) -> AutocompleteResponse:
         """
-        Fast prefix search for real-time search box suggestions.
-        Returns matching book titles, authors, and aliases (limit 10-15 items).
+        High-performance prefix & typo-tolerant autocomplete system.
+        Searches book titles, authors, and aliases using indexed prefix lookups,
+        SQLite FTS5, and fallback fuzzy matching for typographical errors.
+        Caches frequent queries in an in-memory LRU cache.
         """
         clean_prefix = prefix.strip()[:50]
-        if not clean_prefix:
-            return AutocompleteResponse(query=clean_prefix, results=[])
+        # Start searching only after 2 characters
+        if len(clean_prefix) < 2:
+            return AutocompleteResponse(query=clean_prefix, suggestions=[], results=[])
 
         norm_prefix = TextNormalizer.normalize(clean_prefix)
-        if not norm_prefix:
-            return AutocompleteResponse(query=clean_prefix, results=[])
+        if len(norm_prefix) < 2:
+            return AutocompleteResponse(query=clean_prefix, suggestions=[], results=[])
+
+        # Enforce maximum of 10 suggestions
+        max_suggestions = min(max(1, limit), 10)
+        cache_key = f"{norm_prefix}:{max_suggestions}"
+
+        # 10. Check LRU Cache
+        if cache_key in self._autocomplete_cache:
+            cached_resp = self._autocomplete_cache[cache_key]
+            self._autocomplete_cache.move_to_end(cache_key)
+            return cached_resp
 
         conn = self._get_connection()
         cursor = conn.cursor()
-        seen_keys: Set[str] = set()
-        items: List[AutocompleteItem] = []
+        seen_texts: Set[str] = set()
+        book_id_counts: Dict[int, int] = {}
+        suggestions: List[AutocompleteItem] = []
 
-        # 1. Matching Book Titles by Prefix
+        def can_add(item_type: str, book_id: int, text: str) -> bool:
+            norm_t = text.lower().strip()
+            if not norm_t or norm_t in seen_texts:
+                return False
+            # Allow at most 2 items per book id so suggestions stay diverse
+            if item_type == "book" and book_id_counts.get(book_id, 0) >= 2:
+                return False
+            return True
+
+        def add_item(
+            item_type: str,
+            book_id: int,
+            text: str,
+            author: Optional[str] = None,
+            isbn: Optional[str] = None,
+            category: Optional[str] = None,
+        ) -> bool:
+            if not can_add(item_type, book_id, text):
+                return False
+            seen_texts.add(text.lower().strip())
+            if item_type == "book":
+                book_id_counts[book_id] = book_id_counts.get(book_id, 0) + 1
+            suggestions.append(
+                AutocompleteItem(
+                    id=book_id,
+                    text=text,
+                    title=text,
+                    author=author,
+                    isbn=isbn,
+                    category=category,
+                    type=item_type,
+                )
+            )
+            return True
+
+        # Phase 1: High-Performance Indexed Prefix Matching
+        # 1. Matching Book Titles by Prefix (indexed idx_books_norm_title)
         cursor.execute(
             """
             SELECT id, title, author, isbn, category, popularity_score
@@ -365,101 +420,193 @@ class SearchEngine:
             WHERE normalized_title LIKE ?
             ORDER BY popularity_score DESC LIMIT ?
             """,
-            (f"{norm_prefix}%", limit),
+            (f"{norm_prefix}%", max_suggestions),
         )
         for r in cursor.fetchall():
-            key = f"b:{r['id']}"
-            if key not in seen_keys:
-                seen_keys.add(key)
-                items.append(
-                    AutocompleteItem(
-                        id=r["id"],
-                        title=r["title"],
-                        author=r["author"],
-                        isbn=r["isbn"],
-                        category=r["category"],
-                        type="book",
-                    )
-                )
+            add_item("book", r["id"], r["title"], r["author"], r["isbn"], r["category"])
 
-        # 2. Matching Authors by Prefix (e.g. 'har' -> Haruki Murakami)
-        if len(items) < limit:
+        # 2. Matching Book Aliases by Prefix (indexed idx_aliases_norm_alias)
+        if len(suggestions) < max_suggestions:
             cursor.execute(
                 """
-                SELECT id, title, author, category, popularity_score
-                FROM books
-                WHERE normalized_author LIKE ?
-                ORDER BY popularity_score DESC LIMIT ?
-                """,
-                (f"{norm_prefix}%", limit - len(items)),
-            )
-            for r in cursor.fetchall():
-                key = f"a:{r['author']}"
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    items.append(
-                        AutocompleteItem(
-                            id=r["id"],
-                            title=r["author"],
-                            author=f"Author of '{r['title']}'",
-                            category=r["category"],
-                            type="author",
-                        )
-                    )
-
-        # 3. Matching Book Aliases by Prefix
-        if len(items) < limit:
-            cursor.execute(
-                """
-                SELECT b.id, b.title, b.author, b.category, a.alias
+                SELECT b.id, b.title, b.author, b.isbn, b.category, a.alias, a.normalized_alias, a.confidence, b.popularity_score
                 FROM book_aliases a
                 JOIN books b ON b.id = a.book_id
                 WHERE a.normalized_alias LIKE ?
-                ORDER BY a.confidence DESC, b.popularity_score DESC LIMIT ?
+                ORDER BY
+                  CASE WHEN a.normalized_alias = ? THEN 1 ELSE 2 END,
+                  a.confidence DESC, b.popularity_score DESC LIMIT ?
                 """,
-                (f"{norm_prefix}%", limit - len(items)),
+                (f"{norm_prefix}%", norm_prefix, max_suggestions),
             )
             for r in cursor.fetchall():
-                key = f"b:{r['id']}"
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    items.append(
-                        AutocompleteItem(
-                            id=r["id"],
-                            title=r["title"],
-                            author=r["author"],
-                            category=r["category"],
-                            type="alias",
-                        )
-                    )
+                alias_clean = r["alias"].strip()
+                disp_text = alias_clean.title() if alias_clean.islower() else alias_clean
+                add_item("book", r["id"], disp_text, r["author"], r["isbn"], r["category"])
+                if len(suggestions) < max_suggestions:
+                    add_item("book", r["id"], r["title"], r["author"], r["isbn"], r["category"])
 
-        # 4. Partial substring matching if prefix yielded few results
-        if len(items) < 5 and len(norm_prefix) >= 3:
+        # 3. Matching Authors by Prefix (indexed idx_books_norm_author)
+        if len(suggestions) < max_suggestions:
             cursor.execute(
                 """
                 SELECT id, title, author, isbn, category, popularity_score
                 FROM books
-                WHERE normalized_title LIKE ? OR normalized_author LIKE ?
+                WHERE normalized_author LIKE ?
                 ORDER BY popularity_score DESC LIMIT ?
                 """,
-                (f"%{norm_prefix}%", f"%{norm_prefix}%", limit - len(items)),
+                (f"{norm_prefix}%", max_suggestions),
             )
             for r in cursor.fetchall():
-                key = f"b:{r['id']}"
-                if key not in seen_keys:
-                    seen_keys.add(key)
-                    items.append(
-                        AutocompleteItem(
-                            id=r["id"],
-                            title=r["title"],
-                            author=r["author"],
-                            isbn=r["isbn"],
-                            category=r["category"],
-                            type="book",
-                        )
-                    )
+                add_item("author", r["id"], r["author"], r["author"], r["isbn"], r["category"])
+                if len(suggestions) < max_suggestions:
+                    add_item("book", r["id"], r["title"], r["author"], r["isbn"], r["category"])
 
-        return AutocompleteResponse(query=clean_prefix, results=items[:limit])
+        # 4. SQLite FTS5 Prefix Matching (books_fts)
+        if len(suggestions) < max_suggestions:
+            tokens = [t for t in norm_prefix.split() if len(t) >= 2]
+            if tokens:
+                fts_query = " ".join([f'"{t}"*' for t in tokens])
+                try:
+                    cursor.execute(
+                        """
+                        SELECT rowid, title, author, category
+                        FROM books_fts
+                        WHERE books_fts MATCH ?
+                        LIMIT ?
+                        """,
+                        (fts_query, max_suggestions),
+                    )
+                    for r in cursor.fetchall():
+                        add_item("book", r[0], r[1], r[2], None, r[3])
+                except Exception as e:
+                    logger.debug("FTS5 autocomplete prefix search failed: %s", e)
+
+        # Phase 2: Typo-Tolerant & Fuzzy Matching
+        # Rule: Use fuzzy matching only when normal prefix matching doesn't produce enough results
+        if len(suggestions) < min(3, max_suggestions):
+            # A. Spell Correction on the Prefix
+            corrected_query, conf, level, _ = self.corrector.correct_query(clean_prefix, conn)
+            if corrected_query and corrected_query != norm_prefix and conf >= 60.0:
+                cursor.execute(
+                    """
+                    SELECT id, title, author, isbn, category
+                    FROM books
+                    WHERE normalized_title LIKE ?
+                    LIMIT ?
+                    """,
+                    (f"{corrected_query}%", max_suggestions),
+                )
+                for r in cursor.fetchall():
+                    add_item("book", r["id"], r["title"], r["author"], r["isbn"], r["category"])
+
+                cursor.execute(
+                    """
+                    SELECT b.id, b.title, b.author, b.isbn, b.category, a.alias
+                    FROM book_aliases a
+                    JOIN books b ON b.id = a.book_id
+                    WHERE a.normalized_alias LIKE ?
+                    LIMIT ?
+                    """,
+                    (f"{corrected_query}%", max_suggestions),
+                )
+                for r in cursor.fetchall():
+                    alias_clean = r["alias"].strip()
+                    disp_text = alias_clean.title() if alias_clean.islower() else alias_clean
+                    add_item("book", r["id"], disp_text, r["author"], r["isbn"], r["category"])
+                    add_item("book", r["id"], r["title"], r["author"], r["isbn"], r["category"])
+
+            # B. Candidate-level Fuzzy Prefix Matching across books and aliases
+            cursor.execute(
+                """
+                SELECT id, title, normalized_title, author, normalized_author, isbn, category, popularity_score
+                FROM books
+                """
+            )
+            all_books = cursor.fetchall()
+
+            cursor.execute(
+                """
+                SELECT b.id, b.title, b.author, b.isbn, b.category, a.alias, a.normalized_alias, b.popularity_score
+                FROM book_aliases a
+                JOIN books b ON b.id = a.book_id
+                """
+            )
+            all_aliases = cursor.fetchall()
+
+            fuzzy_candidates: List[dict] = []
+            for b in all_books:
+                t_slice = b["normalized_title"][:len(norm_prefix) + 4]
+                jw_t = FuzzyMatcher.jaro_winkler_similarity(norm_prefix, t_slice)
+
+                a_slice = (b["normalized_author"] or "")[:len(norm_prefix) + 4]
+                jw_a = FuzzyMatcher.jaro_winkler_similarity(norm_prefix, a_slice) if a_slice else 0.0
+
+                best_sim = max(jw_t, jw_a)
+                if best_sim >= 0.70:
+                    cand_type = "author" if jw_a > jw_t else "book"
+                    disp = b["author"] if cand_type == "author" else b["title"]
+                    fuzzy_candidates.append({
+                        "score": best_sim * 100.0 + (b["popularity_score"] * 0.1),
+                        "type": cand_type,
+                        "id": b["id"],
+                        "text": disp,
+                        "author": b["author"],
+                        "isbn": b["isbn"],
+                        "category": b["category"],
+                    })
+
+            for a in all_aliases:
+                al_slice = a["normalized_alias"][:len(norm_prefix) + 4]
+                jw_al = FuzzyMatcher.jaro_winkler_similarity(norm_prefix, al_slice)
+                if jw_al >= 0.75:
+                    alias_clean = a["alias"].strip()
+                    disp_text = alias_clean.title() if alias_clean.islower() else alias_clean
+                    fuzzy_candidates.append({
+                        "score": jw_al * 100.0 + (a["popularity_score"] * 0.1) + 5.0,
+                        "type": "book",
+                        "id": a["id"],
+                        "text": disp_text,
+                        "author": a["author"],
+                        "isbn": a["isbn"],
+                        "category": a["category"],
+                    })
+                    fuzzy_candidates.append({
+                        "score": jw_al * 100.0 + (a["popularity_score"] * 0.1) + 4.0,
+                        "type": "book",
+                        "id": a["id"],
+                        "text": a["title"],
+                        "author": a["author"],
+                        "isbn": a["isbn"],
+                        "category": a["category"],
+                    })
+
+            fuzzy_candidates.sort(key=lambda x: x["score"], reverse=True)
+            for fc in fuzzy_candidates:
+                if len(suggestions) >= max_suggestions:
+                    break
+                add_item(
+                    fc["type"],
+                    fc["id"],
+                    fc["text"],
+                    fc["author"],
+                    fc["isbn"],
+                    fc["category"],
+                )
+
+        final_items = suggestions[:max_suggestions]
+        response = AutocompleteResponse(
+            query=clean_prefix,
+            suggestions=final_items,
+            results=final_items,
+        )
+
+        # Store in LRU cache
+        if len(self._autocomplete_cache) >= self._autocomplete_cache_size:
+            self._autocomplete_cache.popitem(last=False)
+        self._autocomplete_cache[cache_key] = response
+
+        return response
 
     def get_book(self, book_id: int) -> Optional[BookDetail]:
         """Fetch complete details for a single book by ID."""
